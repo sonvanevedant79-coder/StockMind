@@ -1,0 +1,49 @@
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import Database from 'better-sqlite3';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const db = new Database(path.join(__dirname, 'stockmind.db'));
+db.pragma('foreign_keys = ON');
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', balance REAL NOT NULL DEFAULT 100000, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS stocks (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT UNIQUE NOT NULL, company TEXT NOT NULL, price REAL NOT NULL, change_pct REAL NOT NULL DEFAULT 0, sector TEXT DEFAULT 'Other', active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, stock_id INTEGER NOT NULL REFERENCES stocks(id), UNIQUE(user_id,stock_id));
+CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), stock_id INTEGER NOT NULL REFERENCES stocks(id), side TEXT NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL, total REAL NOT NULL, status TEXT NOT NULL DEFAULT 'EXECUTED', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS holdings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), stock_id INTEGER NOT NULL REFERENCES stocks(id), quantity INTEGER NOT NULL, avg_price REAL NOT NULL, UNIQUE(user_id,stock_id));
+`);
+const seed = [
+ ['RELIANCE','Reliance Industries',1360.40,1.36,'Energy'],['TCS','Tata Consultancy Services',3482.10,0.80,'IT'],['HDFCBANK','HDFC Bank',1722.60,-0.48,'Banking'],['INFY','Infosys',1568.75,0.79,'IT'],['ICICIBANK','ICICI Bank',1266.25,0.53,'Banking'],['ITC','ITC Limited',428.50,0.32,'FMCG'],['BHARTIARTL','Bharti Airtel',1580.20,1.12,'Telecom'],['SBIN','State Bank of India',824.30,-0.22,'Banking'],['LT','Larsen & Toubro',3650.00,0.65,'Infrastructure'],['WIPRO','Wipro Limited',292.10,-0.35,'IT']
+];
+const insertStock = db.prepare('INSERT OR IGNORE INTO stocks(symbol,company,price,change_pct,sector) VALUES(?,?,?,?,?)');
+seed.forEach(s=>insertStock.run(...s));
+const adminEmail='admin@stockmind.demo';
+if (!db.prepare('SELECT id FROM users WHERE email=?').get(adminEmail)) db.prepare('INSERT INTO users(name,email,password,role,balance) VALUES(?,?,?,?,?)').run('StockMind Admin',adminEmail,bcrypt.hashSync('Admin@123',10),'admin',1000000);
+
+const app=express(); app.use(cors({origin:process.env.CLIENT_ORIGIN || 'http://localhost:5173'})); app.use(express.json());
+const tokenFor=u=>jwt.sign({id:u.id,role:u.role,name:u.name,email:u.email},process.env.JWT_SECRET||'dev_only_change_this_secret', {expiresIn:'7d'});
+function auth(req,res,next){try{const h=req.headers.authorization||'';const token=h.startsWith('Bearer ')?h.slice(7):'';req.user=jwt.verify(token,process.env.JWT_SECRET||'dev_only_change_this_secret');next();}catch{return res.status(401).json({message:'Please log in again.'});}}
+const admin=(req,res,next)=>req.user.role==='admin'?next():res.status(403).json({message:'Admin access required.'});
+app.get('/api/health',(req,res)=>res.json({ok:true,app:'StockMind API'}));
+app.post('/api/auth/register', (req,res)=>{const {name,email,password}=req.body||{};if(!name?.trim()||!email?.trim()||!password||password.length<8)return res.status(400).json({message:'Enter name, valid email and password (at least 8 characters).'});try{const info=db.prepare('INSERT INTO users(name,email,password) VALUES(?,?,?)').run(name.trim(),email.trim().toLowerCase(),bcrypt.hashSync(password,10));const u=db.prepare('SELECT id,name,email,role,balance FROM users WHERE id=?').get(info.lastInsertRowid);res.status(201).json({token:tokenFor(u),user:u});}catch{res.status(409).json({message:'An account with this email already exists.'});}});
+app.post('/api/auth/login',(req,res)=>{const {email,password}=req.body||{};const u=db.prepare('SELECT * FROM users WHERE email=?').get(String(email||'').toLowerCase());if(!u||!bcrypt.compareSync(password||'',u.password))return res.status(401).json({message:'Incorrect email or password.'});const safe={id:u.id,name:u.name,email:u.email,role:u.role,balance:u.balance};res.json({token:tokenFor(safe),user:safe});});
+app.get('/api/auth/me',auth,(req,res)=>{const u=db.prepare('SELECT id,name,email,role,balance FROM users WHERE id=?').get(req.user.id);res.json(u);});
+app.get('/api/stocks',auth,(req,res)=>{const q=`%${String(req.query.q||'').trim()}%`;res.json(db.prepare('SELECT * FROM stocks WHERE active=1 AND (symbol LIKE ? OR company LIKE ?) ORDER BY symbol').all(q,q));});
+app.get('/api/dashboard',auth,(req,res)=>{const u=db.prepare('SELECT balance FROM users WHERE id=?').get(req.user.id);const holdings=db.prepare(`SELECT h.quantity,h.avg_price,s.symbol,s.company,s.price,s.change_pct,(h.quantity*s.price) value,((s.price-h.avg_price)*h.quantity) pnl FROM holdings h JOIN stocks s ON s.id=h.stock_id WHERE h.user_id=?`).all(req.user.id);const invested=holdings.reduce((a,h)=>a+h.quantity*h.avg_price,0);const marketValue=holdings.reduce((a,h)=>a+h.value,0);const pnl=holdings.reduce((a,h)=>a+h.pnl,0);const orders=db.prepare(`SELECT o.*,s.symbol,s.company FROM orders o JOIN stocks s ON s.id=o.stock_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 6`).all(req.user.id);res.json({balance:u.balance,holdings,invested,marketValue,pnl,totalValue:u.balance+marketValue,orders});});
+app.get('/api/watchlist',auth,(req,res)=>res.json(db.prepare('SELECT s.* FROM watchlist w JOIN stocks s ON s.id=w.stock_id WHERE w.user_id=? ORDER BY s.symbol').all(req.user.id)));
+app.post('/api/watchlist/:stockId',auth,(req,res)=>{try{db.prepare('INSERT INTO watchlist(user_id,stock_id) VALUES(?,?)').run(req.user.id,Number(req.params.stockId));res.status(201).json({message:'Added to watchlist.'});}catch{res.status(409).json({message:'Stock is already in your watchlist.'});}});
+app.delete('/api/watchlist/:stockId',auth,(req,res)=>{db.prepare('DELETE FROM watchlist WHERE user_id=? AND stock_id=?').run(req.user.id,Number(req.params.stockId));res.json({message:'Removed from watchlist.'});});
+app.post('/api/trades',auth,(req,res)=>{const {symbol,side,quantity}=req.body||{};const qty=Number(quantity);if(!['BUY','SELL'].includes(side)||!Number.isInteger(qty)||qty<1||qty>100000)return res.status(400).json({message:'Choose Buy/Sell and enter a valid whole-number quantity.'});const stock=db.prepare('SELECT * FROM stocks WHERE symbol=? AND active=1').get(String(symbol||'').toUpperCase());if(!stock)return res.status(404).json({message:'Stock not found.'});const trade=db.transaction(()=>{const user=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);const total=stock.price*qty;const holding=db.prepare('SELECT * FROM holdings WHERE user_id=? AND stock_id=?').get(req.user.id,stock.id);if(side==='BUY'){if(user.balance<total)throw new Error('Insufficient virtual balance.');const newQty=(holding?.quantity||0)+qty;const avg=((holding?.quantity||0)*(holding?.avg_price||0)+total)/newQty;if(holding)db.prepare('UPDATE holdings SET quantity=?,avg_price=? WHERE id=?').run(newQty,avg,holding.id);else db.prepare('INSERT INTO holdings(user_id,stock_id,quantity,avg_price) VALUES(?,?,?,?)').run(req.user.id,stock.id,qty,stock.price);db.prepare('UPDATE users SET balance=balance-? WHERE id=?').run(total,req.user.id);}else{if(!holding||holding.quantity<qty)throw new Error('You do not have enough shares to sell.');const remaining=holding.quantity-qty;if(remaining===0)db.prepare('DELETE FROM holdings WHERE id=?').run(holding.id);else db.prepare('UPDATE holdings SET quantity=? WHERE id=?').run(remaining,holding.id);db.prepare('UPDATE users SET balance=balance+? WHERE id=?').run(total,req.user.id);}const id=db.prepare('INSERT INTO orders(user_id,stock_id,side,quantity,price,total) VALUES(?,?,?,?,?,?)').run(req.user.id,stock.id,side,qty,stock.price,total).lastInsertRowid;return {id,symbol:stock.symbol,side,quantity:qty,price:stock.price,total,status:'EXECUTED'};});try{res.status(201).json(trade());}catch(e){res.status(400).json({message:e.message});}});
+app.get('/api/orders',auth,(req,res)=>res.json(db.prepare('SELECT o.*,s.symbol,s.company FROM orders o JOIN stocks s ON s.id=o.stock_id WHERE o.user_id=? ORDER BY o.id DESC').all(req.user.id)));
+app.get('/api/admin/users',auth,admin,(req,res)=>res.json(db.prepare('SELECT id,name,email,role,balance,created_at FROM users ORDER BY id DESC').all()));
+app.get('/api/admin/orders',auth,admin,(req,res)=>res.json(db.prepare('SELECT o.*,u.name user_name,s.symbol FROM orders o JOIN users u ON u.id=o.user_id JOIN stocks s ON s.id=o.stock_id ORDER BY o.id DESC LIMIT 200').all()));
+app.post('/api/admin/stocks',auth,admin,(req,res)=>{const {symbol,company,price,sector}=req.body||{};if(!symbol||!company||!(Number(price)>0))return res.status(400).json({message:'Symbol, company and positive price are required.'});try{const info=db.prepare('INSERT INTO stocks(symbol,company,price,sector) VALUES(?,?,?,?)').run(symbol.toUpperCase(),company,Number(price),sector||'Other');res.status(201).json(db.prepare('SELECT * FROM stocks WHERE id=?').get(info.lastInsertRowid));}catch{return res.status(409).json({message:'That stock symbol already exists.'});}});
+app.patch('/api/admin/stocks/:id',(req,res)=>{ /* protected route is registered below */ res.status(404).end(); });
+app.use((err,req,res,next)=>{console.error(err);res.status(500).json({message:'Unexpected server error.'});});
+const port=process.env.PORT||5000;app.listen(port,()=>console.log(`StockMind API running at http://localhost:${port}`));
